@@ -672,7 +672,7 @@ fn subcommand_help(prog: &str, cmd: &str) -> Option<String> {
              (time limit reached, or stopped by the user) is downloaded the same way.\n\
              `status` reports `idle`, `recording` or `finished`.\n\n\
              Options:\n\
-               --max-duration SEC  Stop by itself after SEC seconds (default: 60, at most 300)\n\
+               --max-duration SEC  Stop by itself after SEC seconds (default: 60, at most 600)\n\
                -o, --output PATH   Output MP4 path (default: ~/.agents-term/tmp/agentsterm-recording-<timestamp>-<pid>.mp4)\n\
                --no-fetch          Stop without downloading the video\n"
         ),

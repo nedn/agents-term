@@ -1,0 +1,2 @@
+- **Screen recordings up to 10 minutes** ([PR #185](https://github.com/AppEvol/agents-term/pull/185)):
+  - `agents_term_app_cli record start --max-duration` now accepts up to 600 seconds (was 300). The default stays 60.

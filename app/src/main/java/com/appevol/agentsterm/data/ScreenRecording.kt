@@ -109,7 +109,7 @@ class ScreenRecordingCommands(
         val COMMANDS = listOf("record_start", "record_stop", "record_status", "record_read")
 
         const val DEFAULT_MAX_DURATION_SEC = 60L
-        const val MAX_DURATION_SEC = 300L
+        const val MAX_DURATION_SEC = 600L
 
         /** Largest chunk `record_read` returns: small enough for one WebSocket message. */
         const val MAX_CHUNK_BYTES = 512 * 1024

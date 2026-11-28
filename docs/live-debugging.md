@@ -108,7 +108,7 @@ agents_term_app_cli record status                       # idle | recording | fin
 - The app must be in the foreground when the recording starts: Android shows its own "start recording?" dialog and the user has to accept it. Tell the user before you run `record start`. If they decline or do not answer within 60 seconds, the command exits `4`.
 - The video is recorded by Android's screen capture, so it shows the whole screen, including the keyboard and system bars. If the user picks "a single app" in the dialog, it shows only that app. Other apps and notifications that appear on screen are recorded too.
 - The video uses the same pixel space as `screenshot` (at most 1080 pixels wide).
-- A recording ends by itself after `--max-duration` seconds (default 60, at most 300), when the user stops it from the notification or the status bar, or when they turn the setting off. `record stop` then downloads what was recorded; `stopReason` says why it ended.
+- A recording ends by itself after `--max-duration` seconds (default 60, at most 600), when the user stops it from the notification or the status bar, or when they turn the setting off. `record stop` then downloads what was recorded; `stopReason` says why it ended.
 - The phone keeps only the last recording, and `record start` discards it. Download it with `record stop` first.
 - The video is downloaded in chunks over the app's WebSocket, at up to about 20 MB per minute of video. Keep recordings short.
 - To look at a recording yourself, extract frames from it (for example `ffmpeg -i flow.mp4 -vf fps=2 frame-%03d.png`) and read those.
