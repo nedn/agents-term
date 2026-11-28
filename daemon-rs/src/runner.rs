@@ -15,7 +15,10 @@ use crate::config::{
     agents_debugging_tips_path, enriched_path, home_dir, resolve_binary, tab_attachments_dir,
     WORK_DONE_SYSTEM_INSTRUCTION,
 };
-use crate::harnesses::turn::{TurnOutcome, TurnParser, TurnRequest, TurnSink};
+use crate::harnesses::turn::{
+    value_as_u64, GenerationSample, SessionUsageBaseline, TurnOutcome, TurnParser, TurnRequest,
+    TurnSink,
+};
 use crate::harnesses::{self, Harness};
 use crate::log::{log_error, log_info, log_warn};
 use crate::shell::{signal_process_group, PersistentShell, StdinState};
@@ -1157,6 +1160,8 @@ impl AgentRunner {
         new_cwd: Option<String>,
         usage: Option<Value>,
         denied_actions: Vec<Value>,
+        throughput: Option<GenerationSample>,
+        session_usage: Option<SessionUsageBaseline>,
     ) {
         let active_arc = self.active.lock().unwrap().remove(tab_id);
         let mut drain_queue_on_exit = false;
@@ -1374,16 +1379,20 @@ impl AgentRunner {
         ));
 
         if !interrupted && !failed && final_status == "complete" {
-            if let (Some(agent), Some(model), Some(tokens), Ok(duration)) = (
+            if let (Some(agent), Some(model), Some(sample)) = (
                 tab["agent"].as_str(),
                 final_msg["model"].as_str(),
-                final_msg["usage"]["outputTokens"].as_u64(),
-                u64::try_from(duration_ms),
+                throughput,
             ) {
-                self.store
-                    .record_throughput(agent, model, tokens, duration, |rates| {
+                self.store.record_throughput(
+                    agent,
+                    model,
+                    sample.output_tokens,
+                    sample.duration_ms,
+                    |rates| {
                         (self.broadcast)(json!({"type":"model_throughput", "throughput":rates}));
-                    });
+                    },
+                );
             }
         }
         self.store.replace_message(tab_id, final_msg.clone());
@@ -1396,6 +1405,22 @@ impl AgentRunner {
         patch.insert("unread".into(), json!(true));
         if let Some(sref) = session_ref {
             patch.insert("sessionRef".into(), sref);
+        }
+        if let Some(mut su) = session_usage {
+            if interrupted || failed || final_status != "complete" {
+                su.valid = false;
+            }
+            patch.insert("sessionUsage".into(), su.to_value());
+        } else if (interrupted || failed) && !is_shell {
+            if let Some(mut existing_su) = tab
+                .get("sessionUsage")
+                .and_then(SessionUsageBaseline::from_value)
+            {
+                if existing_su.valid {
+                    existing_su.valid = false;
+                    patch.insert("sessionUsage".into(), existing_su.to_value());
+                }
+            }
         }
         if let Some(cwd) = new_cwd {
             patch.insert("cwd".into(), json!(cwd));
@@ -1847,6 +1872,8 @@ impl AgentRunner {
                         outcome.new_cwd,
                         None,
                         Vec::new(),
+                        None,
+                        None,
                     );
                 }
                 Err(err) => {
@@ -1903,6 +1930,68 @@ impl AgentRunner {
         );
     }
 
+    fn prior_session_usage_for_tab(
+        &self,
+        tab: &Value,
+        harness_kind: &str,
+        current_msg_id: &str,
+    ) -> Option<SessionUsageBaseline> {
+        if let Some(baseline) = tab
+            .get("sessionUsage")
+            .and_then(SessionUsageBaseline::from_value)
+        {
+            return Some(baseline);
+        }
+        let session_id = tab
+            .get("sessionRef")
+            .and_then(Value::as_object)
+            .filter(|o| o.get("kind").and_then(Value::as_str) == Some(harness_kind))
+            .and_then(|o| o.get("value").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        let tab_id = tab.get("id").and_then(Value::as_str)?;
+        // Migrate pre-existing resumed tabs created before `sessionUsage` was persisted:
+        // inspect previous assistant messages to recover the last cumulative totals.
+        let messages = self.store.get_messages(tab_id);
+        let mut last_baseline: Option<SessionUsageBaseline> = None;
+        for msg in messages {
+            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if msg.get("id").and_then(Value::as_str) == Some(current_msg_id) {
+                continue;
+            }
+            let status = msg.get("status").and_then(Value::as_str).unwrap_or("");
+            let usage = msg.get("usage").and_then(Value::as_object);
+            let out = usage.and_then(|u| value_as_u64(u.get("outputTokens")));
+            if status == "complete" && out.is_some() {
+                last_baseline = Some(SessionUsageBaseline {
+                    session_id: session_id.clone(),
+                    input_tokens: usage.and_then(|u| value_as_u64(u.get("inputTokens"))),
+                    output_tokens: out,
+                    thinking_tokens: usage.and_then(|u| value_as_u64(u.get("thinkingTokens"))),
+                    valid: true,
+                });
+            } else if status != "complete"
+                || msg
+                    .get("toolCalls")
+                    .and_then(Value::as_array)
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+            {
+                // An intervening real turn ended without reporting usage; invalidate any baseline.
+                last_baseline = Some(SessionUsageBaseline {
+                    session_id: session_id.clone(),
+                    input_tokens: last_baseline.as_ref().and_then(|b| b.input_tokens),
+                    output_tokens: last_baseline.as_ref().and_then(|b| b.output_tokens),
+                    thinking_tokens: last_baseline.as_ref().and_then(|b| b.thinking_tokens),
+                    valid: false,
+                });
+            }
+        }
+        last_baseline
+    }
+
     /// Runs one turn of a coding-agent harness: builds its command, spawns it, and feeds each
     /// output line to the harness's parser.
     fn run_harness_turn(
@@ -1930,6 +2019,15 @@ impl AgentRunner {
             );
             return;
         };
+        let current_msg_id = msg_arc
+            .lock()
+            .unwrap()
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let prior_session_usage =
+            self.prior_session_usage_for_tab(&tab, harness.kind(), &current_msg_id);
         let system_prompt_dirty = self.system_prompt_dirty.lock().unwrap().remove(&tab_id);
         let prepared = harness.prepare_turn(TurnRequest {
             system_prompt: effective_system_prompt(&tab),
@@ -1939,6 +2037,7 @@ impl AgentRunner {
             cwd: cwd.clone(),
             permission_mode,
             system_prompt_dirty,
+            prior_session_usage,
         });
         self.set_status_detail(&tab_id, prepared.status);
 
@@ -1964,6 +2063,8 @@ impl AgentRunner {
                     session_ref: None,
                     usage: None,
                     denied: Vec::new(),
+                    throughput: None,
+                    session_usage: None,
                 });
             runner_fin.finalize_turn(
                 &tid_fin,
@@ -1976,6 +2077,8 @@ impl AgentRunner {
                 None,
                 outcome.usage,
                 outcome.denied,
+                outcome.throughput,
+                outcome.session_usage,
             );
         };
 
@@ -1990,5 +2093,160 @@ impl AgentRunner {
             handle_line,
             finish,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ScratchRunner {
+        root: PathBuf,
+        store: StateStore,
+        runner: AgentRunner,
+    }
+
+    impl ScratchRunner {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("agentsterm-runner-test-{}", rand_hex(12)));
+            let store = StateStore::open_in(root.clone());
+            let runner = AgentRunner::new(store.clone(), Arc::new(|_| {}));
+            Self {
+                root,
+                store,
+                runner,
+            }
+        }
+    }
+
+    impl Drop for ScratchRunner {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn infers_prior_session_usage_from_legacy_messages_and_invalidates_after_interruption() {
+        let env = ScratchRunner::new();
+        let tab = env
+            .store
+            .create_tab(
+                "codex",
+                None,
+                None,
+                None,
+                Some(&json!("gpt-test")),
+                None,
+                None,
+            )
+            .unwrap();
+        let tab_id = tab["id"].as_str().unwrap().to_string();
+        let mut patch = Map::new();
+        patch.insert(
+            "sessionRef".into(),
+            json!({ "kind": "codex", "value": "thread-legacy" }),
+        );
+        let tab = env.store.update_tab(&tab_id, patch).unwrap();
+
+        env.store.add_message(
+            &tab_id,
+            json!({
+                "id": "m1",
+                "role": "assistant",
+                "status": "complete",
+                "usage": { "inputTokens": 5000, "outputTokens": 700, "thinkingTokens": 100 },
+            }),
+        );
+        let inferred = env
+            .runner
+            .prior_session_usage_for_tab(&tab, "codex", "m_current")
+            .expect("inferred baseline");
+        assert_eq!(inferred.session_id, "thread-legacy");
+        assert_eq!(inferred.output_tokens, Some(700));
+        assert!(inferred.valid);
+
+        // A subsequent interrupted turn invalidates the inferred baseline.
+        env.store.add_message(
+            &tab_id,
+            json!({
+                "id": "m2",
+                "role": "assistant",
+                "status": "interrupted",
+                "usage": { "durationMs": 12000 },
+            }),
+        );
+        let invalidated = env
+            .runner
+            .prior_session_usage_for_tab(&tab, "codex", "m_current")
+            .expect("invalidated baseline");
+        assert_eq!(invalidated.output_tokens, Some(700));
+        assert!(!invalidated.valid);
+    }
+
+    #[test]
+    fn finalize_turn_records_pure_generation_throughput_not_wall_time() {
+        let env = ScratchRunner::new();
+        let tab = env
+            .store
+            .create_tab(
+                "claude",
+                None,
+                None,
+                None,
+                Some(&json!("claude-test")),
+                None,
+                None,
+            )
+            .unwrap();
+        let tab_id = tab["id"].as_str().unwrap().to_string();
+        let msg = json!({
+            "id": "m1",
+            "tabId": tab_id,
+            "role": "assistant",
+            "text": "done",
+            "thinking": "",
+            "segments": [{ "type": "text", "text": "done" }],
+            "toolCalls": [],
+            "deniedActions": [],
+            "status": "streaming",
+            "model": "claude-test",
+            "error": Value::Null,
+            "usage": Value::Null,
+            "createdAt": 1,
+            "updatedAt": 1,
+        });
+        env.store.add_message(&tab_id, msg.clone());
+        let msg_arc = Arc::new(Mutex::new(msg));
+
+        // 20 minutes wall time, but only 10 seconds pure LLM generation for 800 tokens = 80 tok/s.
+        env.runner.finalize_turn(
+            &tab_id,
+            &msg_arc,
+            false,
+            Some(0),
+            "",
+            1_200_000,
+            None,
+            None,
+            Some(json!({
+                "inputTokens": 10,
+                "outputTokens": 800,
+                "thinkingTokens": Value::Null,
+                "costUsd": 0.1,
+                "durationMs": 1_200_000,
+            })),
+            Vec::new(),
+            Some(GenerationSample {
+                output_tokens: 800,
+                duration_ms: 10_000,
+            }),
+            None,
+        );
+
+        env.store.with_throughput(|rates| {
+            assert_eq!(rates.len(), 1);
+            assert_eq!(rates[0]["tokensPerSecond"], 80.0);
+        });
     }
 }

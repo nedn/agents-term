@@ -1,0 +1,4 @@
+- **Accurate model token throughput and per-turn usage** ([PR #184](https://github.com/AppEvol/agents-term/pull/184)):
+  - Compute model output throughput from pure LLM generation time instead of subprocess wall-clock time (using Claude's `duration_api_ms`, Antigravity's per-step `agent_response` durations, and Codex's turn duration minus unioned parallel tool intervals).
+  - Report per-turn token usage instead of cumulative session totals on resumed Codex and Antigravity turns, and accumulate across multiple `result` events in a single Claude invocation.
+  - Bump `model-throughput.json` to schema v2 so legacy wall-clock samples are discarded on upgrade.

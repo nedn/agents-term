@@ -246,6 +246,11 @@ impl StateStore {
         Self::open(StoreFiles::new(agents_term_home()), write_atomic_file)
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_in(root: std::path::PathBuf) -> Self {
+        Self::open(StoreFiles::new(root), write_atomic_file)
+    }
+
     fn open(
         files: StoreFiles,
         write: impl Fn(&Path, &[u8], u32) -> io::Result<()> + Send + 'static,
@@ -303,11 +308,16 @@ impl StateStore {
         let index_path = files.index_path();
         let ws_path = files.workspace_path();
         let now = now_ms();
-        let mut throughput: throughput::Throughput = fs::read(files.throughput_path())
-            .ok()
-            .and_then(|raw| serde_json::from_slice(&raw).ok())
-            .unwrap_or_default();
-        let mut recovered_any = throughput.prune(now);
+        let (mut throughput, mut recovered_any) = match fs::read(files.throughput_path()) {
+            Ok(raw) => match serde_json::from_slice::<throughput::Throughput>(&raw) {
+                Ok(parsed) => (parsed, false),
+                // Discard legacy v1 samples recorded with wall-clock / cumulative formulas
+                // and rewrite the file cleanly in v2 format.
+                Err(_) => (throughput::Throughput::default(), true),
+            },
+            Err(_) => (throughput::Throughput::default(), false),
+        };
+        recovered_any |= throughput.prune(now);
         {
             let mut inner = self.inner.lock().unwrap();
             inner.throughput = throughput;
@@ -546,7 +556,7 @@ impl StateStore {
         duration_ms: u64,
         send: impl FnOnce(Vec<Value>),
     ) {
-        if duration_ms == 0 {
+        if tokens == 0 || duration_ms == 0 {
             return;
         }
         let mut inner = self.inner.lock().unwrap();

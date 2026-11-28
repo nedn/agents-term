@@ -1,7 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+const SCHEMA_VERSION: u32 = 2;
 const WINDOW_MS: i64 = 2 * 60 * 60 * 1000;
 const RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
 
@@ -12,8 +13,37 @@ struct Sample {
     duration_ms: u64,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedThroughput {
+    version: u32,
+    samples: BTreeMap<String, BTreeMap<String, Vec<Sample>>>,
+}
+
+#[derive(Clone, Default)]
 pub(super) struct Throughput(BTreeMap<String, BTreeMap<String, Vec<Sample>>>);
+
+impl Serialize for Throughput {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        PersistedThroughput {
+            version: SCHEMA_VERSION,
+            samples: self.0.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Throughput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let persisted = PersistedThroughput::deserialize(deserializer)?;
+        if persisted.version != SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported throughput schema version {}",
+                persisted.version
+            )));
+        }
+        Ok(Self(persisted.samples))
+    }
+}
 
 impl Throughput {
     pub(super) fn record(
@@ -24,6 +54,9 @@ impl Throughput {
         tokens: u64,
         duration_ms: u64,
     ) {
+        if tokens == 0 || duration_ms == 0 {
+            return;
+        }
         let samples = self
             .0
             .entry(agent.into())
@@ -97,5 +130,27 @@ mod tests {
         assert!(t.prune(expiry));
         assert_eq!(t.rates(expiry).len(), 1);
         assert_eq!(t.rates(expiry)[0]["agent"], "b");
+    }
+
+    #[test]
+    fn ignores_zero_token_or_zero_duration_samples() {
+        let mut t = Throughput::default();
+        t.record("a", "m", 10, 0, 5000);
+        t.record("a", "m", 20, 100, 0);
+        assert!(t.rates(30).is_empty());
+        t.record("a", "m", 30, 100, 2000);
+        assert_eq!(t.rates(40)[0]["tokensPerSecond"], 50.0);
+    }
+
+    #[test]
+    fn rejects_legacy_unversioned_format() {
+        let legacy = r#"{"claude":{"m":[{"at":1000,"tokens":10,"duration_ms":600000}]}}"#;
+        assert!(serde_json::from_str::<Throughput>(legacy).is_err());
+
+        let mut t = Throughput::default();
+        t.record("claude", "m", 1000, 100, 2000);
+        let encoded = serde_json::to_string(&t).unwrap();
+        let decoded: Throughput = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.rates(1000)[0]["tokensPerSecond"], 50.0);
     }
 }

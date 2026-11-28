@@ -1,15 +1,16 @@
 //! Turn execution for the Antigravity harness: CLI arguments and stream-json event parsing.
 
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::harnesses::turn::{
-    denied_from, num_or_null, tool_output_text, truncate_chars, PreparedTurn, TurnOutcome,
-    TurnParser, TurnRequest, TurnSink, MAX_TOOL_OUTPUT,
+    cumulative_delta, denied_from, session_ref_value, tool_output_text, truncate_chars,
+    union_interval_ms, value_as_u64, GenerationSample, PreparedTurn, SessionUsageBaseline,
+    TurnOutcome, TurnParser, TurnRequest, TurnSink, MAX_TOOL_OUTPUT,
 };
 use crate::util::{
-    block_separator, is_finite_number, is_number, js_round, js_str, js_truthy, json_pretty, now_ms,
-    rand_hex, summarize_tool_input, BlockBreaks,
+    block_separator, is_finite_number, js_round, js_str, js_truthy, json_pretty, now_ms, rand_hex,
+    summarize_tool_input, BlockBreaks,
 };
 
 /// Builds the CLI arguments for one turn and the parser for its output.
@@ -21,6 +22,7 @@ pub(crate) fn prepare_turn(req: TurnRequest) -> PreparedTurn {
         system_prompt,
         system_prompt_dirty,
         attachments_dir,
+        prior_session_usage,
         ..
     } = req;
 
@@ -73,12 +75,18 @@ pub(crate) fn prepare_turn(req: TurnRequest) -> PreparedTurn {
 
     let parser = AgyTurn {
         session_ref: session,
-        usage: None,
+        is_resume,
+        prior_session_usage,
+        started_at: now_ms(),
+        step_usages: BTreeMap::new(),
+        synthetic_step_seq: 0,
+        result_usage: None,
         saw_text: false,
         text_step: None,
         think_step: None,
         denied: Vec::new(),
         tool_starts: HashMap::new(),
+        tool_intervals: Vec::new(),
         breaks: BlockBreaks::default(),
     };
     PreparedTurn {
@@ -88,38 +96,73 @@ pub(crate) fn prepare_turn(req: TurnRequest) -> PreparedTurn {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct AgyStepUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    thinking_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+    duration_ms: Option<u64>,
+}
+
 struct AgyTurn {
     session_ref: Option<Value>,
-    usage: Option<Value>,
+    is_resume: bool,
+    prior_session_usage: Option<SessionUsageBaseline>,
+    started_at: i64,
+    step_usages: BTreeMap<String, AgyStepUsage>,
+    synthetic_step_seq: u64,
+    result_usage: Option<AgyStepUsage>,
     saw_text: bool,
     text_step: Option<Value>,
     think_step: Option<Value>,
     denied: Vec<Value>,
     tool_starts: HashMap<String, i64>,
+    tool_intervals: Vec<(i64, i64)>,
     breaks: BlockBreaks,
 }
 
-fn parse_agy_usage(raw_usage: Option<&Value>, duration_seconds: Option<&Value>) -> Option<Value> {
+fn parse_agy_usage(
+    raw_usage: Option<&Value>,
+    duration_seconds: Option<&Value>,
+    duration_ms_override: Option<&Value>,
+    cost_override: Option<&Value>,
+) -> Option<AgyStepUsage> {
     let u = raw_usage
         .filter(|v| js_truthy(v))
         .and_then(Value::as_object)?;
-    let dur = duration_seconds
+    let duration_ms = duration_seconds
         .and_then(is_finite_number)
-        .map(|d| json!(js_round(d * 1000.0)))
-        .or_else(|| u.get("duration_ms").filter(|v| is_number(v)).cloned())
-        .unwrap_or(Value::Null);
-    let cost = u
-        .get("total_cost_usd")
-        .filter(|v| is_number(v))
-        .cloned()
-        .unwrap_or_else(|| num_or_null(u.get("cost_usd")));
-    Some(json!({
-        "inputTokens": num_or_null(u.get("input_tokens")),
-        "outputTokens": num_or_null(u.get("output_tokens")),
-        "thinkingTokens": num_or_null(u.get("thinking_tokens")),
-        "costUsd": cost,
-        "durationMs": dur,
-    }))
+        .and_then(|d| (d >= 0.0).then(|| js_round(d * 1000.0) as u64))
+        .or_else(|| value_as_u64(duration_ms_override))
+        .or_else(|| value_as_u64(u.get("duration_ms")));
+    let cost_usd = cost_override
+        .and_then(is_finite_number)
+        .or_else(|| u.get("total_cost_usd").and_then(is_finite_number))
+        .or_else(|| u.get("cost_usd").and_then(is_finite_number));
+    Some(AgyStepUsage {
+        input_tokens: value_as_u64(u.get("input_tokens")),
+        output_tokens: value_as_u64(u.get("output_tokens")),
+        thinking_tokens: value_as_u64(u.get("thinking_tokens")),
+        cost_usd,
+        duration_ms,
+    })
+}
+
+fn sum_opt_u64(iter: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    let mut sum: Option<u64> = None;
+    for val in iter.flatten() {
+        sum = Some(sum.unwrap_or(0).saturating_add(val));
+    }
+    sum
+}
+
+fn sum_opt_f64(iter: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut sum: Option<f64> = None;
+    for val in iter.flatten() {
+        sum = Some(sum.unwrap_or(0.0) + val);
+    }
+    sum
 }
 
 impl TurnParser for AgyTurn {
@@ -252,10 +295,17 @@ impl TurnParser for AgyTurn {
                         };
                         sink.emit_delta(Some(format!("{sep}{td}")), None, false);
                     }
-                    if let Some(u) =
-                        parse_agy_usage(step.get("usage"), step.get("duration_seconds"))
-                    {
-                        self.usage = Some(u);
+                    if let Some(u) = parse_agy_usage(
+                        step.get("usage"),
+                        step.get("duration_seconds"),
+                        step.get("duration_ms"),
+                        None,
+                    ) {
+                        let key = step_idx.as_ref().map(js_str).unwrap_or_else(|| {
+                            self.synthetic_step_seq += 1;
+                            format!("__anon_{}", self.synthetic_step_seq)
+                        });
+                        self.step_usages.insert(key, u);
                     }
                     return;
                 }
@@ -373,11 +423,20 @@ impl TurnParser for AgyTurn {
                             && (matches!(step_state.as_str(), "ERROR" | "FAILED")
                                 || tool_info.get("is_error").map(js_truthy).unwrap_or(false)
                                 || tool_info.get("error").map(js_truthy).unwrap_or(false));
-                        let dur = step
+                        let end = now_ms();
+                        let reported_ms = step
                             .get("duration_seconds")
                             .and_then(is_finite_number)
-                            .map(|d| json!(js_round(d * 1000.0)))
-                            .or_else(|| self.tool_starts.get(&tool_id).map(|s| json!(now_ms() - s)))
+                            .map(|d| js_round(d * 1000.0));
+                        let tracked_start = self.tool_starts.remove(&tool_id);
+                        if let Some(s) = tracked_start {
+                            self.tool_intervals.push((s, end));
+                        } else if let Some(ms) = reported_ms.filter(|&m| m > 0) {
+                            self.tool_intervals.push((end.saturating_sub(ms), end));
+                        }
+                        let dur = reported_ms
+                            .map(|ms| json!(ms))
+                            .or_else(|| tracked_start.map(|s| json!(end - s)))
                             .unwrap_or(Value::Null);
                         if is_denied {
                             self.denied.push(json!({
@@ -481,8 +540,13 @@ impl TurnParser for AgyTurn {
                             .insert("error".into(), json!(msg_err));
                     }
                 }
-                if let Some(u) = parse_agy_usage(res.get("usage"), res.get("duration_seconds")) {
-                    self.usage = Some(u);
+                if let Some(u) = parse_agy_usage(
+                    res.get("usage"),
+                    res.get("duration_seconds"),
+                    res.get("duration_ms"),
+                    res.get("total_cost_usd"),
+                ) {
+                    self.result_usage = Some(u);
                 }
                 if let Some(denials) = res.get("permission_denials").and_then(Value::as_array) {
                     for d in denials {
@@ -666,7 +730,11 @@ impl TurnParser for AgyTurn {
                 .map(|s| truncate_chars(&s, MAX_TOOL_OUTPUT));
                 let is_err = b.get("is_error").map(js_truthy).unwrap_or(false)
                     || b.get("error").map(js_truthy).unwrap_or(false);
-                let dur = self.tool_starts.get(&tool_id).map(|s| json!(now_ms() - s));
+                let end = now_ms();
+                let dur = self.tool_starts.remove(&tool_id).map(|s| {
+                    self.tool_intervals.push((s, end));
+                    json!(end - s)
+                });
                 let name = existing
                     .as_ref()
                     .and_then(|e| e.get("name").and_then(Value::as_str))
@@ -717,14 +785,13 @@ impl TurnParser for AgyTurn {
                         .insert("error".into(), json!(res_val));
                 }
             }
-            if let Some(u) = obj.get("usage").and_then(Value::as_object) {
-                self.usage = Some(json!({
-                    "inputTokens": num_or_null(u.get("input_tokens")),
-                    "outputTokens": num_or_null(u.get("output_tokens")),
-                    "thinkingTokens": num_or_null(u.get("thinking_tokens")),
-                    "costUsd": num_or_null(obj.get("total_cost_usd")),
-                    "durationMs": num_or_null(obj.get("duration_ms")),
-                }));
+            if let Some(u) = parse_agy_usage(
+                obj.get("usage"),
+                obj.get("duration_seconds"),
+                obj.get("duration_ms"),
+                obj.get("total_cost_usd"),
+            ) {
+                self.result_usage = Some(u);
             }
             if let Some(denials) = obj.get("permission_denials").and_then(Value::as_array) {
                 for d in denials {
@@ -751,11 +818,129 @@ impl TurnParser for AgyTurn {
         }
     }
 
-    fn finish(self: Box<Self>) -> TurnOutcome {
+    fn finish(mut self: Box<Self>) -> TurnOutcome {
+        let finished_at = now_ms();
+        for (_, start) in self.tool_starts.drain() {
+            self.tool_intervals.push((start, finished_at));
+        }
+
+        let session_id = session_ref_value(self.session_ref.as_ref());
+        let matching_prior = self
+            .prior_session_usage
+            .as_ref()
+            .filter(|b| Some(b.session_id.as_str()) == session_id.as_deref());
+
+        let (usage, throughput, session_usage) = if !self.step_usages.is_empty() {
+            // Real `agy` CLI emits exact per-LLM-call usage and duration_seconds on each
+            // `agent_response` step, excluding tool calls and prior turns in the conversation.
+            let turn_in = sum_opt_u64(self.step_usages.values().map(|s| s.input_tokens));
+            let turn_out = sum_opt_u64(self.step_usages.values().map(|s| s.output_tokens));
+            let turn_think = sum_opt_u64(self.step_usages.values().map(|s| s.thinking_tokens));
+            let turn_cost = sum_opt_f64(self.step_usages.values().map(|s| s.cost_usd));
+
+            let mut gen_tokens: u64 = 0;
+            let mut gen_duration_ms: u64 = 0;
+            for step in self.step_usages.values() {
+                if let (Some(tok), Some(dur)) = (step.output_tokens, step.duration_ms) {
+                    if tok > 0 && dur > 0 {
+                        gen_tokens = gen_tokens.saturating_add(tok);
+                        gen_duration_ms = gen_duration_ms.saturating_add(dur);
+                    }
+                }
+            }
+            let throughput = (gen_tokens > 0 && gen_duration_ms > 0).then_some(GenerationSample {
+                output_tokens: gen_tokens,
+                duration_ms: gen_duration_ms,
+            });
+            let usage = Some(json!({
+                "inputTokens": turn_in,
+                "outputTokens": turn_out,
+                "thinkingTokens": turn_think,
+                "costUsd": turn_cost,
+                "durationMs": Value::Null,
+            }));
+            let updated_baseline = session_id.and_then(|sid| {
+                self.result_usage.as_ref().map(|raw| SessionUsageBaseline {
+                    session_id: sid,
+                    input_tokens: raw.input_tokens,
+                    output_tokens: raw.output_tokens,
+                    thinking_tokens: raw.thinking_tokens,
+                    valid: true,
+                })
+            });
+            (usage, throughput, updated_baseline)
+        } else if let Some(raw) = self.result_usage {
+            // Fallback for older/fake `agy` output that only emits a final `result` event.
+            let turn_in = cumulative_delta(
+                raw.input_tokens,
+                matching_prior.and_then(|p| p.input_tokens),
+            );
+            let turn_out = cumulative_delta(
+                raw.output_tokens,
+                matching_prior.and_then(|p| p.output_tokens),
+            );
+            let turn_think = cumulative_delta(
+                raw.thinking_tokens,
+                matching_prior.and_then(|p| p.thinking_tokens),
+            );
+            let baseline_clean = match matching_prior {
+                Some(p) => p.valid,
+                None => !self.is_resume,
+            };
+            let turn_dur_ms = if self.is_resume {
+                None
+            } else {
+                raw.duration_ms
+            };
+            let usage = Some(json!({
+                "inputTokens": turn_in,
+                "outputTokens": turn_out,
+                "thinkingTokens": turn_think,
+                "costUsd": raw.cost_usd,
+                "durationMs": turn_dur_ms,
+            }));
+            let throughput = if baseline_clean {
+                turn_out
+                    .filter(|&tokens| tokens > 0)
+                    .and_then(|output_tokens| {
+                        let wall_ms = (finished_at - self.started_at).max(0) as u64;
+                        let base_ms = turn_dur_ms.unwrap_or(wall_ms);
+                        let tool_ms =
+                            union_interval_ms(&self.tool_intervals, self.started_at, finished_at);
+                        let active_ms = base_ms.saturating_sub(tool_ms);
+                        (active_ms > 0).then_some(GenerationSample {
+                            output_tokens,
+                            duration_ms: active_ms,
+                        })
+                    })
+            } else {
+                None
+            };
+            let updated_baseline = session_id.map(|sid| SessionUsageBaseline {
+                session_id: sid,
+                input_tokens: raw.input_tokens,
+                output_tokens: raw.output_tokens,
+                thinking_tokens: raw.thinking_tokens,
+                valid: true,
+            });
+            (usage, throughput, updated_baseline)
+        } else {
+            let invalidated = session_id.map(|sid| SessionUsageBaseline {
+                session_id: sid,
+                input_tokens: matching_prior.and_then(|p| p.input_tokens),
+                output_tokens: matching_prior.and_then(|p| p.output_tokens),
+                thinking_tokens: matching_prior.and_then(|p| p.thinking_tokens),
+                valid: false,
+            });
+            (None, None, invalidated)
+        };
+
         TurnOutcome {
             session_ref: self.session_ref,
-            usage: self.usage,
+            usage,
             denied: self.denied,
+            throughput,
+            session_usage,
         }
     }
 }
@@ -763,7 +948,7 @@ impl TurnParser for AgyTurn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harnesses::turn::test_request;
+    use crate::harnesses::turn::{test_request, TestTurnEnv};
 
     #[test]
     fn new_session_sends_system_prompt_in_the_print_argument() {
@@ -809,5 +994,84 @@ mod tests {
             .last()
             .unwrap()
             .starts_with("--print=<system_instructions>"));
+    }
+
+    #[test]
+    fn sums_per_step_agent_response_usage_and_ignores_cumulative_result() {
+        let env = TestTurnEnv::new("agy");
+        let tab = json!({
+            "id": "tab_test",
+            "sessionRef": { "kind": "agy", "value": "conv-1" },
+        });
+        let mut turn = prepare_turn(test_request(tab, "full-access", false));
+        // Step 6 (first LLM call in resumed turn 2) updates twice with same step_index; deduplicated.
+        turn.parser.handle_line(
+            r#"{"event":"step_update","conversation_id":"conv-1","step_update":{"step_index":6,"step_type":"agent_response","state":"DONE","duration_seconds":4.0,"usage":{"input_tokens":5000,"output_tokens":300,"thinking_tokens":200}}}"#,
+            &env.sink,
+        );
+        turn.parser.handle_line(
+            r#"{"event":"step_update","conversation_id":"conv-1","step_update":{"step_index":6,"step_type":"agent_response","state":"DONE","duration_seconds":4.5,"usage":{"input_tokens":5000,"output_tokens":350,"thinking_tokens":220}}}"#,
+            &env.sink,
+        );
+        // Long tool call step (300s) — must NOT count toward model generation time.
+        turn.parser.handle_line(
+            r#"{"event":"step_update","conversation_id":"conv-1","step_update":{"step_index":7,"step_type":"tool","state":"DONE","tool_call_id":"t1","tool_name":"run_command","duration_seconds":300.0,"tool_info":{"output":"ok"}}}"#,
+            &env.sink,
+        );
+        // Step 8 (second LLM call in this turn).
+        turn.parser.handle_line(
+            r#"{"event":"step_update","conversation_id":"conv-1","step_update":{"step_index":8,"step_type":"agent_response","state":"DONE","duration_seconds":1.5,"usage":{"input_tokens":2000,"output_tokens":150,"thinking_tokens":80}}}"#,
+            &env.sink,
+        );
+        // Cumulative result from conversation start (includes 15,000 tokens from turn 1 & 1 hour duration).
+        turn.parser.handle_line(
+            r#"{"event":"result","result":{"conversation_id":"conv-1","status":"SUCCESS","response":"done","duration_seconds":3600.0,"usage":{"input_tokens":50000,"output_tokens":15500,"thinking_tokens":9300}}}"#,
+            &env.sink,
+        );
+        let outcome = turn.parser.finish();
+        let usage = outcome.usage.expect("usage");
+        assert_eq!(usage["inputTokens"], 7000);
+        assert_eq!(usage["outputTokens"], 500);
+        assert_eq!(usage["thinkingTokens"], 300);
+        // durationMs left null so runner fills per-turn wall time instead of 3600s conversation age.
+        assert!(usage["durationMs"].is_null());
+        assert_eq!(
+            outcome.throughput,
+            Some(GenerationSample {
+                output_tokens: 500,
+                duration_ms: 6000,
+            })
+        );
+        let baseline = outcome.session_usage.expect("baseline");
+        assert_eq!(baseline.output_tokens, Some(15_500));
+        assert!(baseline.valid);
+    }
+
+    #[test]
+    fn fallback_result_only_subtracts_prior_session_baseline() {
+        let env = TestTurnEnv::new("agy");
+        let tab = json!({
+            "id": "tab_test",
+            "sessionRef": { "kind": "agy", "value": "conv-1" },
+        });
+        let mut req = test_request(tab, "full-access", false);
+        req.prior_session_usage = Some(SessionUsageBaseline {
+            session_id: "conv-1".to_string(),
+            input_tokens: Some(1000),
+            output_tokens: Some(200),
+            thinking_tokens: Some(50),
+            valid: true,
+        });
+        let mut turn = prepare_turn(req);
+        turn.parser.handle_line(
+            r#"{"event":"result","result":{"conversation_id":"conv-1","status":"SUCCESS","response":"ok","duration_seconds":500.0,"usage":{"input_tokens":1400,"output_tokens":260,"thinking_tokens":80}}}"#,
+            &env.sink,
+        );
+        let outcome = turn.parser.finish();
+        let usage = outcome.usage.expect("usage");
+        assert_eq!(usage["inputTokens"], 400);
+        assert_eq!(usage["outputTokens"], 60);
+        assert_eq!(usage["thinkingTokens"], 30);
+        assert!(usage["durationMs"].is_null());
     }
 }

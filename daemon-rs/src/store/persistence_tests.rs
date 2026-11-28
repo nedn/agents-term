@@ -144,3 +144,23 @@ fn model_throughput_survives_restart_without_tab_history() {
         assert_eq!(rates[0]["tokensPerSecond"], 60.0);
     });
 }
+
+#[test]
+fn legacy_v1_throughput_file_is_discarded_and_rewritten_on_open() {
+    let home = TestHome::new();
+    let files = home.files();
+    fs::create_dir_all(&files.root).unwrap();
+    fs::write(
+        files.throughput_path(),
+        r#"{"claude":{"old-model":[{"at":1795830000000,"tokens":100,"duration_ms":2000000}]}}"#,
+    )
+    .unwrap();
+    let store = StateStore::open(home.files(), write_atomic_file);
+    store.with_throughput(|rates| {
+        assert!(rates.is_empty());
+    });
+    store.save_now().unwrap();
+    let rewritten: Value =
+        serde_json::from_slice(&fs::read(files.throughput_path()).unwrap()).unwrap();
+    assert_eq!(rewritten["version"], 2);
+}
